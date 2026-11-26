@@ -1,5 +1,5 @@
-name: salad_bar
-description: سلطة بار - نظام إدارة الطلبات
+name: dar_app
+description: DAR - منصة إدارة الطلبات والتوصيل
 publish_to: 'none'
 version: 1.0.0+1
 
