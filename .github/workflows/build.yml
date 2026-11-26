@@ -1,6 +1,16 @@
 name: Build APK
 on:
   workflow_dispatch:
+    inputs:
+      brand_name:
+        description: 'اسم التطبيق (مثال: DAR أو اسم مشروع العميل)'
+        default: 'DAR'
+      app_id:
+        description: 'معرّف الحزمة: حروف إنجليزية صغيرة وأرقام (مثال: app أو admin أو d4k9x2)'
+        default: 'app'
+      admin:
+        description: 'نسخة مدير المنصة؟ (true أو false)'
+        default: 'false'
   push:
     branches: [main, master]
 
@@ -23,14 +33,17 @@ jobs:
         run: |
           cp lib/main.dart /tmp/main.dart
           cp pubspec.yaml /tmp/pubspec.yaml
-          flutter create --org com.saladbar --project-name salad_bar --platforms android .
+          flutter create --org com.dar --project-name dar_app --platforms android .
           cp /tmp/main.dart lib/main.dart
           cp /tmp/pubspec.yaml pubspec.yaml
 
       - name: Patch AndroidManifest
+        env:
+          BRAND_NAME: ${{ inputs.brand_name || 'DAR' }}
         run: |
           python3 - <<'PY'
           p = 'android/app/src/main/AndroidManifest.xml'
+          import os
           s = open(p, encoding='utf-8').read()
           add = '''<uses-permission android:name="android.permission.INTERNET"/>
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
@@ -41,17 +54,19 @@ jobs:
               </queries>
               <application'''
           s = s.replace('<application', add, 1)
-          s = s.replace('android:label="salad_bar"', 'android:label="سلطة بار"')
+          s = s.replace('android:label="dar_app"', 'android:label="' + os.environ.get('BRAND_NAME', 'DAR').replace('"', '') + '"')
           open(p, 'w', encoding='utf-8').write(s)
           PY
 
       - name: Sign with permanent key
+        env:
+          APP_ID: ${{ inputs.app_id || 'app' }}
         run: |
-          test -f salad_bar.jks || (echo "ملف salad_bar.jks غير موجود في المستودع" && exit 1)
-          cp salad_bar.jks android/app/salad_bar.jks
+          test -f dar.jks || (echo "ملف dar.jks غير موجود في المستودع" && exit 1)
+          cp dar.jks android/app/dar.jks
           python3 - <<'PY'
           import os, re
-          PW = 'RMa8w6CCvkhA0KSlYs'
+          PW = 'HqNcoHtqZ3sVwfGukfa9'
           kts = 'android/app/build.gradle.kts'
           gr = 'android/app/build.gradle'
           if os.path.exists(kts):
@@ -59,9 +74,9 @@ jobs:
               s = open(p, encoding='utf-8').read()
               block = '''signingConfigs {
                   create("release") {
-                      storeFile = file("salad_bar.jks")
+                      storeFile = file("dar.jks")
                       storePassword = "''' + PW + '''"
-                      keyAlias = "saladbar"
+                      keyAlias = "dar"
                       keyPassword = "''' + PW + '''"
                   }
               }
@@ -73,9 +88,9 @@ jobs:
               s = open(p, encoding='utf-8').read()
               block = '''signingConfigs {
                   release {
-                      storeFile file("salad_bar.jks")
+                      storeFile file("dar.jks")
                       storePassword "''' + PW + '''"
-                      keyAlias "saladbar"
+                      keyAlias "dar"
                       keyPassword "''' + PW + '''"
                   }
               }
@@ -84,6 +99,11 @@ jobs:
               s, n = re.subn(r'signingConfig\s+signingConfigs\.debug', 'signingConfig signingConfigs.release', s)
           if n == 0:
               raise SystemExit('تعذر ضبط التوقيع في ' + p)
+          import os as _os
+          app_id = re.sub(r'[^a-z0-9]', '', _os.environ.get('APP_ID', 'app').lower()) or 'app'
+          s, n2 = re.subn(r'(applicationId\s*=?\s*)"[^"]+"', lambda m: m.group(1) + '"com.dar.' + app_id + '"', s)
+          if n2 == 0:
+              raise SystemExit('تعذر ضبط معرّف الحزمة')
           open(p, 'w', encoding='utf-8').write(s)
           print('signing patched in', p)
           PY
@@ -154,9 +174,13 @@ jobs:
           GR
 
       - run: flutter pub get
-      - run: flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }} --dart-define=BUILD=${{ github.run_number }}
+      - name: Build APK
+        env:
+          BRAND_NAME: ${{ inputs.brand_name || 'DAR' }}
+          ADMIN: ${{ inputs.admin || 'false' }}
+        run: flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }} --dart-define=BUILD=${{ github.run_number }} --dart-define=BRAND_NAME="$BRAND_NAME" --dart-define=ADMIN=$ADMIN
 
       - uses: actions/upload-artifact@v4
         with:
-          name: salad-bar-apk
+          name: dar-apk-${{ inputs.app_id || 'app' }}
           path: build/app/outputs/flutter-apk/app-release.apk
