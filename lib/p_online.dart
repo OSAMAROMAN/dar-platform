@@ -45,6 +45,13 @@ class _OnlineSettingsPageState extends State<OnlineSettingsPage> {
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 700),
           child: ListView(padding: const EdgeInsets.fromLTRB(14, 14, 14, 40), children: [
+            if (!cloud.planWeb)
+              Container(
+                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(color: C.red.withOpacity(.1), borderRadius: BorderRadius.circular(14)),
+                child: const Text('باقتك الحالية لا تشمل القائمة الإلكترونية. للترقية تواصل مع مزوّد الخدمة.', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12.5, height: 1.6)),
+              ),
             if (!cloud.isOwner || !cloud.configured)
               Container(
                 margin: const EdgeInsets.only(bottom: 12),
@@ -60,7 +67,7 @@ class _OnlineSettingsPageState extends State<OnlineSettingsPage> {
                   title: const Text('تفعيل القائمة الإلكترونية', style: TextStyle(fontWeight: FontWeight.w900)),
                   subtitle: const Text('يظهر للعملاء قائمة أصنافك وأسعارها ويطلبون منها', style: TextStyle(fontSize: 11)),
                   value: cfg.onlineEnabled,
-                  onChanged: (v) => st.updateOnline(enabled: v),
+                  onChanged: cloud.planWeb ? (v) => st.updateOnline(enabled: v) : null,
                 ),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,

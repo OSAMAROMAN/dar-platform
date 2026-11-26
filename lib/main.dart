@@ -29,9 +29,26 @@ import 'cloud_config.dart';
 
 part 'p_extra.dart';
 part 'p_online.dart';
+part 'p_platform.dart';
+part 'p_admin.dart';
 
 /// رقم البناء (يُحقن من GitHub Actions)
 const int kBuild = int.fromEnvironment('BUILD', defaultValue: 0);
+
+/// اسم العلامة وهوية البناء (تُحقن من ملف البناء)
+const String kBrandName = String.fromEnvironment('BRAND_NAME', defaultValue: 'DAR');
+const bool kAdminBuild = bool.fromEnvironment('ADMIN', defaultValue: false);
+
+/// يمنع كلمات المرور الضعيفة. يعيد نص المشكلة أو null إن كانت مقبولة
+String? passwordProblem(String pw, String login) {
+  if (pw.length < 8) return 'كلمة المرور 8 أحرف على الأقل';
+  if (!RegExp(r'[A-Za-z\u0600-\u06FF]').hasMatch(pw) || !RegExp(r'\d').hasMatch(pw)) return 'يجب أن تحتوي حروفاً وأرقاماً معاً';
+  final l = login.toLowerCase().split('@').first;
+  if (l.length >= 3 && pw.toLowerCase().contains(l)) return 'لا تضع اسم الدخول داخل كلمة المرور';
+  const weak = ['12345678', '123456789', '1234567890', 'password', 'password1', 'qwerty123', 'abc12345', 'admin123', '11111111', '00000000', 'iloveyou1'];
+  if (weak.contains(pw.toLowerCase())) return 'كلمة المرور شائعة وسهلة التخمين';
+  return null;
+}
 
 // ====================================================================
 //  أدوات عامة
@@ -1475,7 +1492,10 @@ String fbErr(String m) {
 }
 
 class CloudService extends ChangeNotifier {
-  String? email, uid, role, captainKey, name, refreshToken;
+  String? email, uid, role, captainKey, name, refreshToken, tid;
+  bool mustChange = false;
+  Map<String, dynamic>? tenant;
+  DateTime? tenantAt;
   String? _token;
   DateTime _exp = DateTime(2000);
   File? _file;
@@ -1487,6 +1507,7 @@ class CloudService extends ChangeNotifier {
   bool get signedIn => uid != null && role != null;
   bool get isOwner => signedIn && role == 'owner';
   bool get isCaptain => signedIn && role == 'captain';
+  bool get isSuper => signedIn && role == 'super';
   int get captainId => _keyNum(captainKey ?? 'c0');
   String get _base => kFbDbUrl.replaceAll(RegExp(r'/+$'), '');
 
@@ -1502,6 +1523,10 @@ class CloudService extends ChangeNotifier {
         captainKey = j['captainKey'];
         name = j['name'];
         refreshToken = j['refreshToken'];
+        tid = j['tid'];
+        mustChange = j['mustChange'] == true;
+        tenant = j['tenant'] is Map ? Map<String, dynamic>.from(j['tenant']) : null;
+        tenantAt = j['tenantAt'] == null ? null : DateTime.tryParse('${j['tenantAt']}');
         // جلسة قديمة بلا رمز تجديد: تُعتبر منتهية
         if (refreshToken == null) {
           uid = null;
@@ -1519,14 +1544,28 @@ class CloudService extends ChangeNotifier {
         if (await f.exists()) await f.delete();
       } else {
         await f.writeAsString(
-            jsonEncode({'email': email, 'uid': uid, 'role': role, 'captainKey': captainKey, 'name': name, 'refreshToken': refreshToken}),
+            jsonEncode({
+              'email': email,
+              'uid': uid,
+              'role': role,
+              'captainKey': captainKey,
+              'name': name,
+              'refreshToken': refreshToken,
+              'tid': tid,
+              'mustChange': mustChange,
+              'tenant': tenant,
+              'tenantAt': tenantAt?.toIso8601String(),
+            }),
             flush: true);
       }
     } catch (_) {}
   }
 
   Future<void> logout() async {
-    email = uid = role = captainKey = name = refreshToken = null;
+    email = uid = role = captainKey = name = refreshToken = tid = null;
+    mustChange = false;
+    tenant = null;
+    tenantAt = null;
     _token = null;
     _ordersEtag = null;
     _ordersCache = null;
@@ -1601,10 +1640,19 @@ class CloudService extends ChangeNotifier {
     }
   }
 
+  static const _global = ['users', 'tenants', 'plans', 'platform'];
+
+  /// مسارات بيانات العميل تُحفظ تحت t/{tid}/ لعزل كل مشروع
+  String _p(String path) {
+    final first = path.split('/').first;
+    if (_global.contains(first) || tid == null || first == 't') return path;
+    return 't/$tid/$path';
+  }
+
   Future<http.Response?> _db(String method, String path, {Object? body, Map<String, String>? q, Map<String, String>? hdr}) async {
     final t = await _tok();
     if (t == null) return null;
-    final uri = Uri.parse('$_base/$path.json').replace(queryParameters: {'auth': t, ...?q});
+    final uri = Uri.parse('$_base/${_p(path)}.json').replace(queryParameters: {'auth': t, ...?q});
     return _req(method, uri, body, <String, String>{'Content-Type': 'application/json', ...?hdr});
   }
 
@@ -1615,7 +1663,7 @@ class CloudService extends ChangeNotifier {
   }
 
   Future<void> checkUpdate() async {
-    final r = await _pub('GET', 'meta');
+    final r = await _pub('GET', 'platform/meta');
     if (_ok(r)) {
       final j = jsonDecode(r!.body);
       if (j is Map) {
@@ -1651,19 +1699,199 @@ class CloudService extends ChangeNotifier {
     return null;
   }
 
+  // ---- المنصة: الدخول والاشتراك ----
+  String loginEmail(String id) {
+    final t = id.trim().toLowerCase();
+    return t.contains('@') ? t : '$t@dar.app';
+  }
+
+  Future<String?> login(String id, String pw) async {
+    if (!configured) return 'لم يُضبط Firebase في التطبيق';
+    final e = await _signInRaw(loginEmail(id), pw);
+    if (e != null) return e;
+    final g = await _db('GET', 'users/$uid');
+    if (!_ok(g)) {
+      await logout();
+      return 'تعذّر الاتصال بقاعدة البيانات';
+    }
+    final cur = jsonDecode(g!.body);
+    if (cur is! Map || cur['role'] == null) {
+      await logout();
+      return 'هذا الحساب غير مفعّل في المنصة. تواصل مع مزوّد الخدمة';
+    }
+    final r = '${cur['role']}';
+    final t = cur['tid']?.toString();
+    if (r != 'super' && (t == null || t.isEmpty)) {
+      await logout();
+      return 'الحساب غير مرتبط بمشروع';
+    }
+    role = r;
+    tid = t;
+    captainKey = cur['captainId']?.toString();
+    name = '${cur['name'] ?? ''}';
+    mustChange = cur['mustChange'] == true;
+    tenant = null;
+    tenantAt = null;
+    await _store();
+    notifyListeners();
+    return null;
+  }
+
+  /// إنشاء أول مدير للمنصة (يعمل مرة واحدة فقط بحسب القواعد)
+  Future<String?> bootstrapSuper(String em, String pw) async {
+    if (!configured) return 'لم يُضبط Firebase في التطبيق';
+    final pe = passwordProblem(pw, em);
+    if (pe != null) return pe;
+    var e = await _signInRaw(em.trim().toLowerCase(), pw, create: true);
+    if (e != null && e == fbErr('EMAIL_EXISTS')) e = await _signInRaw(em.trim().toLowerCase(), pw);
+    if (e != null) return e;
+    final p = await _db('PUT', 'users/$uid', body: {'role': 'super', 'name': 'مدير المنصة'});
+    if (!_ok(p)) {
+      await logout();
+      return 'تعذّر الإنشاء: يوجد مدير مسبقاً أو القواعد غير منشورة';
+    }
+    role = 'super';
+    name = 'مدير المنصة';
+    await _store();
+    notifyListeners();
+    return null;
+  }
+
+  Future<String?> sendReset(String em) async {
+    try {
+      final r = await _req('POST', Uri.parse('https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=$kFbApiKey'),
+          {'requestType': 'PASSWORD_RESET', 'email': em.trim().toLowerCase()}, {'Content-Type': 'application/json'});
+      if (r == null) return 'تعذّر الاتصال بالإنترنت';
+      final j = jsonDecode(r.body);
+      if (j is Map && j['error'] != null) return fbErr('${(j['error'] as Map)['message'] ?? ''}');
+      return null;
+    } catch (_) {
+      return 'تعذّر الإرسال';
+    }
+  }
+
+  Future<String?> changePassword(String oldPw, String newPw) async {
+    final em = email;
+    if (em == null) return 'غير مسجّل الدخول';
+    final pe = passwordProblem(newPw, em);
+    if (pe != null) return pe;
+    final e = await _signInRaw(em, oldPw);
+    if (e != null) return 'كلمة المرور الحالية غير صحيحة';
+    final r = await _req('POST', Uri.parse('https://identitytoolkit.googleapis.com/v1/accounts:update?key=$kFbApiKey'),
+        {'idToken': _token, 'password': newPw, 'returnSecureToken': true}, {'Content-Type': 'application/json'});
+    if (r == null) return 'تعذّر الاتصال بالإنترنت';
+    final j = jsonDecode(r.body);
+    if (j is Map && j['error'] != null) return fbErr('${(j['error'] as Map)['message'] ?? ''}');
+    if (j is Map && j['idToken'] != null) {
+      _token = '${j['idToken']}';
+      _exp = DateTime.now().add(Duration(seconds: int.tryParse('${j['expiresIn']}') ?? 3600));
+      if (j['refreshToken'] != null) refreshToken = '${j['refreshToken']}';
+    }
+    if (mustChange) {
+      await _db('PUT', 'users/$uid/mustChange', body: false);
+      mustChange = false;
+    }
+    await _store();
+    notifyListeners();
+    return null;
+  }
+
+  Future<void> loadTenant() async {
+    if (tid == null) return;
+    final r = await _db('GET', 'tenants/$tid');
+    if (_ok(r)) {
+      final j = jsonDecode(r!.body);
+      if (j is Map) {
+        tenant = Map<String, dynamic>.from(j);
+        tenantAt = DateTime.now();
+        await _store();
+        notifyListeners();
+      }
+    }
+  }
+
+  /// ok | grace | locked | suspended | offline | unverified
+  String get lockState {
+    if (!isOwner && !isCaptain) return 'ok';
+    final t = tenant;
+    if (t == null) return 'unverified';
+    if ('${t['status']}' != 'active') return 'suspended';
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final lock = (t['lockAt'] as num?)?.toInt() ?? 0;
+    final exp = (t['expiresAt'] as num?)?.toInt() ?? 0;
+    if (lock > 0 && now > lock) return 'locked';
+    final at = tenantAt;
+    if (at != null && DateTime.now().difference(at).inDays >= 3) return 'offline';
+    if (exp > 0 && now > exp) return 'grace';
+    return 'ok';
+  }
+
+  DateTime? get expiresAt {
+    final e = tenant?['expiresAt'];
+    return e is num ? DateTime.fromMillisecondsSinceEpoch(e.toInt()) : null;
+  }
+
+  int? get daysLeft {
+    final e = expiresAt;
+    return e == null ? null : (e.difference(DateTime.now()).inHours / 24).ceil();
+  }
+
+  Map<String, dynamic> get plan => Map<String, dynamic>.from((tenant?['plan'] as Map?) ?? {});
+  int get maxCaptains => (plan['maxCaptains'] as num?)?.toInt() ?? 0;
+  int get maxItems => (plan['maxItems'] as num?)?.toInt() ?? 0;
+  bool get planWeb => plan['web'] != false;
+  bool get planCaptainApp => plan['captainApp'] != false;
+  Map<String, dynamic> get support => Map<String, dynamic>.from((tenant?['support'] as Map?) ?? {});
+
+  // ---- المنصة: إدارة العملاء (مدير المنصة) ----
+  Future<Map<String, dynamic>?> adminGet(String path, {Map<String, String>? q}) async {
+    final r = await _db('GET', path, q: q);
+    if (!_ok(r)) return null;
+    return _asMap(jsonDecode(r!.body));
+  }
+
+  Future<bool> verifyPassword(String pw) async {
+    final em = email;
+    if (em == null) return false;
+    return await _signInRaw(em, pw) == null;
+  }
+
+  Future<bool> adminPut(String path, Object? body) async => _ok(await _db('PUT', path, body: body));
+  Future<bool> adminPatch(String path, Map<String, dynamic> body) async => _ok(await _db('PATCH', path, body: body));
+  Future<bool> adminDelete(String path) async => _ok(await _db('DELETE', path));
+
+  /// ينشئ حساب دخول جديد بدون تغيير جلسة المدير
+  Future<(String?, String?)> createAccount(String loginId, String pw) async {
+    try {
+      final j = await _identity('accounts:signUp', loginEmail(loginId), pw);
+      if (j['error'] != null) return (fbErr('${(j['error'] as Map)['message'] ?? ''}'), null);
+      return (null, j['localId'] as String);
+    } catch (_) {
+      return ('تعذّر الاتصال بالإنترنت', null);
+    }
+  }
+
+  Future<List<String>?> tenantUserIds(String t) async {
+    final r = await _db('GET', 'users', q: {'orderBy': '"tid"', 'equalTo': '"$t"'});
+    if (!_ok(r)) return null;
+    final j = jsonDecode(r!.body);
+    return j is Map ? [for (final k in j.keys) '$k'] : <String>[];
+  }
+
   // ---- حسابات الكباتن (المالك) ----
-  String captainEmail(String login) => '${login.trim().toLowerCase()}@saladbar.app';
+  String captainEmail(String login) => loginEmail(login);
 
   Future<(String?, String?)> createCaptainAccount(int cid, String cname, String login, String pw) async {
     if (!isOwner) return ('فعّل الربط السحابي من الإعدادات أولاً', null);
     final l = login.trim().toLowerCase();
     if (!RegExp(r'^[a-z0-9._-]{3,30}$').hasMatch(l)) return ('اسم الدخول: حروف إنجليزية وأرقام فقط (3 أحرف على الأقل)', null);
-    if (pw.length < 6) return ('كلمة المرور 6 أحرف على الأقل', null);
+    final pwErr = passwordProblem(pw, l);
+    if (pwErr != null) return (pwErr, null);
     try {
       final j = await _identity('accounts:signUp', captainEmail(l), pw);
       if (j['error'] != null) return (fbErr('${(j['error'] as Map)['message'] ?? ''}'), null);
       final newUid = j['localId'] as String;
-      final r = await _db('PUT', 'users/$newUid', body: {'role': 'captain', 'captainId': cKey(cid), 'name': cname, 'login': l});
+      final r = await _db('PUT', 'users/$newUid', body: {'role': 'captain', 'tid': tid, 'captainId': cKey(cid), 'name': cname, 'login': l, 'mustChange': true});
       if (!_ok(r)) return ('تعذّر ربط الحساب بقاعدة البيانات', null);
       return (null, newUid);
     } catch (_) {
@@ -1925,7 +2153,7 @@ class CloudService extends ChangeNotifier {
       final pu = await _db('GET', 'publicOrders');
       out.add(_ok(pu) ? '✓ قراءة طلبات القائمة الإلكترونية' : '✗ تعذّرت قراءة طلبات القائمة — حدّث القواعد');
     }
-    final m = await _pub('GET', 'meta');
+    final m = await _pub('GET', 'platform/meta');
     out.add(_ok(m) ? '✓ قراءة معلومات الإصدار' : '✗ تعذّرت قراءة /meta — حدّث القواعد');
     return out;
   }
@@ -1982,27 +2210,12 @@ class AppStore extends ChangeNotifier {
   }
 
   void _seed() {
-    settings = AppSettings(storeAddress: 'مكرونة مخلوطة .. طعم يرضيك')..setPassword('1234');
+    settings = AppSettings(storeName: kBrandName, storeAddress: '')..setPassword('${_newKey()}${_newKey()}');
+    settings.mustChange = false;
     products = [];
     _nP = 1;
-    void add(String n, double p) => products.add(Product(id: _nP++, name: n, price: p, stock: 0, lowStock: 10, track: false));
-    for (final f in ['عادي', 'ليمون', 'سبايسي']) {
-      add('سلطة البار - $f - كبير', 1500);
-      add('سلطة البار - $f - وسط', 800);
-      add('سلطة البار - $f - صغير', 500);
-    }
-    add('سلطة الذرة بالدريتوس - كبير', 1700);
-    add('سلطة الذرة بالدريتوس - وسط', 1000);
-    add('سلطة الذرة بالدريتوس - صغير', 700);
-    for (final f in ['فراولة وبلوبيري', 'عنب+توت', 'خوخ', 'ليمون']) {
-      add('موهيتو - $f', 600);
-    }
-    customers = [
-      Customer(id: 1, name: 'عميل تجريبي', phone: '967700000000', address: 'صنعاء', notes: 'يفضل الاتصال قبل التوصيل'),
-    ];
-    captains = [
-      Captain(id: 1, name: 'كابتن أسامة وهان', phone: '967783182367'),
-    ];
+    customers = [];
+    captains = [];
     orders = [];
     settlements = [];
     purchases = [];
@@ -2010,9 +2223,31 @@ class AppStore extends ChangeNotifier {
     stockMoves = [];
     closes = [];
     _captainsFixed = true;
-    _nC = 2;
-    _nCap = 2;
+    _nC = 1;
+    _nCap = 1;
     _nO = 1;
+  }
+
+  /// يطبّق اسم المشروع وهاتفه من بيانات الاشتراك عند أول دخول
+  void applyTenant(Map<String, dynamic>? t) {
+    if (t == null) return;
+    var ch = false;
+    final n = '${t['name'] ?? ''}'.trim();
+    if (n.isNotEmpty && (settings.storeName == kBrandName || settings.storeName == 'متجري')) {
+      settings.storeName = n;
+      ch = true;
+    }
+    final on = '${t['ownerName'] ?? ''}'.trim();
+    if (on.isNotEmpty && settings.ownerName == 'صاحب المتجر') {
+      settings.ownerName = on;
+      ch = true;
+    }
+    final ph = '${t['phone'] ?? ''}'.trim();
+    if (ph.isNotEmpty && settings.storePhone.isEmpty) {
+      settings.storePhone = ph;
+      ch = true;
+    }
+    if (ch) _save();
   }
 
   void _load(Map<String, dynamic> j) {
@@ -2037,18 +2272,7 @@ class AppStore extends ChangeNotifier {
     }
   }
 
-  /// مرة واحدة: حذف الكباتن الافتراضيين القدامى (إن لم يكن لهم حركة) وإضافة الكابتن أسامة وهان
-  void _fixCaptains() {
-    const oldPhones = {'967733333333', '967744444444'};
-    captains.removeWhere((c) =>
-        oldPhones.contains(c.phone) &&
-        !orders.any((o) => o.captainId == c.id) &&
-        !settlements.any((x) => x.captainId == c.id) &&
-        !purchases.any((x) => x.captainId == c.id));
-    if (!captains.any((c) => waNumber(c.phone) == '967783182367')) {
-      captains.add(Captain(id: _nCap++, name: 'كابتن أسامة وهان', phone: '967783182367'));
-    }
-  }
+  void _fixCaptains() {}
 
   Map<String, dynamic> toJson() => {
         'settings': settings.toJson(),
@@ -2558,7 +2782,7 @@ class AppStore extends ChangeNotifier {
     final base = settings.menuUrl.trim();
     if (base.isEmpty) return '';
     final db = kFbDbUrl.replaceAll(RegExp(r'/+$'), '');
-    return '$base${base.contains('?') ? '&' : '?'}db=${Uri.encodeComponent(db)}&$param=$value';
+    return '$base${base.contains('?') ? '&' : '?'}db=${Uri.encodeComponent(db)}&tid=${cloud.tid ?? ''}&$param=$value';
   }
 
   String get menuLink => settings.menuKey.isEmpty ? '' : _linkBase('k', settings.menuKey);
@@ -4400,6 +4624,9 @@ class _ProductFormState extends State<_ProductForm> {
         LuxButton('حفظ', Icons.save_rounded, () {
           if (!form.currentState!.validate()) return;
           final st = context.read<AppStore>();
+          if (widget.product == null && cloud.maxItems > 0 && st.products.length >= cloud.maxItems) {
+            return toast(context, 'وصلت للحد الأقصى من الأصناف في باقتك (${cloud.maxItems})');
+          }
           final p = widget.product ?? Product(id: 0, name: '', price: 0);
           p.name = name.text.trim();
           p.price = num2(price.text);
@@ -5097,6 +5324,9 @@ class _CaptainAccountSheetState extends State<_CaptainAccountSheet> {
       LuxButton(busy ? 'جاري الإنشاء...' : 'إنشاء الحساب', Icons.person_add_alt_1, busy
           ? null
           : () async {
+              final used = context.read<AppStore>().captains.where((x) => x.login != null).length;
+              if (!cloud.planCaptainApp) return toast(context, 'باقتك لا تشمل تطبيق الكابتن');
+              if (cloud.maxCaptains > 0 && used >= cloud.maxCaptains) return toast(context, 'وصلت للحد الأقصى من حسابات الكباتن في باقتك (${cloud.maxCaptains})');
               setState(() => busy = true);
               final (err, newUid) = await cloud.createCaptainAccount(c.id, c.name, login.text, pw.text);
               if (!mounted) return;
@@ -5290,19 +5520,47 @@ class _SettingsPageState extends State<SettingsPage> {
               }),
             ]),
           ),
-          const PageHead('بيانات الدخول'),
-          LuxCard(
-            child: Column(children: [
-              inp('اسم المستخدم', user),
-              inp('كلمة المرور الجديدة (اتركها فارغة للإبقاء على الحالية)', pass, obscure: true),
-              LuxButton('تحديث بيانات الدخول', Icons.lock_outline, () {
-                if (user.text.trim().isEmpty) return toast(context, 'أدخل اسم المستخدم');
-                if (pass.text.isNotEmpty && pass.text.length < 6) return toast(context, 'كلمة المرور 6 أحرف على الأقل');
-                s.updateCredentials(user.text.trim(), pass.text);
-                pass.clear();
-                toast(context, 'تم تحديث بيانات الدخول');
-              }),
-            ]),
+          const PageHead('حسابي والاشتراك'),
+          ListenableBuilder(
+            listenable: cloud,
+            builder: (context, _) {
+              final left = cloud.daysLeft;
+              final sup = cloud.support;
+              return LuxCard(
+                accent: cloud.lockState == 'ok' ? C.g2 : C.orange,
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Text('${cloud.tenant?['name'] ?? kBrandName}', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
+                  const SizedBox(height: 4),
+                  Text('الدخول: ${cloud.email ?? ''}', style: const TextStyle(color: C.muted, fontSize: 12)),
+                  Text('الباقة: ${cloud.plan['name'] ?? '—'}', style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13)),
+                  if (cloud.expiresAt != null)
+                    Text('ينتهي الاشتراك: ${dayKey(cloud.expiresAt!)}${left == null ? '' : left >= 0 ? ' (بعد $left يوم)' : ' (منتهٍ)'}',
+                        style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13, color: (left ?? 99) <= 7 ? C.orange : C.g2)),
+                  if ('${sup['phone'] ?? ''}'.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Text('للتجديد والدعم: ${sup['phone']}', style: const TextStyle(color: C.muted, fontSize: 12)),
+                    ),
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(
+                    onPressed: () => showSheet(context, (_) => const ChangePwSheet()),
+                    icon: const Icon(Icons.lock_reset_rounded),
+                    label: const Text('تغيير كلمة المرور'),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton.icon(
+                    onPressed: () async {
+                      if (!await confirmDialog(context, 'تسجيل الخروج من هذا الجهاز؟', yes: 'خروج')) return;
+                      s.stopCloud();
+                      s.flush();
+                      await cloud.logout();
+                    },
+                    icon: const Icon(Icons.logout_rounded, color: C.red),
+                    label: const Text('تسجيل الخروج', style: TextStyle(color: C.red)),
+                  ),
+                ]),
+              );
+            },
           ),
           const PageHead('النسخ الاحتياطي'),
           LuxCard(
@@ -5371,16 +5629,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     icon: const Icon(Icons.cloud_download_rounded),
                     label: const Text('استرجاع من السحابة'),
                   ),
-                  const SizedBox(height: 8),
-                  TextButton(
-                    onPressed: () async {
-                      if (await confirmDialog(context, 'فصل هذا الجهاز عن السحابة؟ لن تصل الطلبات للكباتن حتى تعيد التفعيل.', yes: 'فصل')) {
-                        s.stopCloud();
-                        await cloud.logout();
-                      }
-                    },
-                    child: const Text('فصل الربط', style: TextStyle(color: C.red)),
-                  ),
+
                 ] else ...[
                   const Text('فعّل الربط ليرى الكباتن طلباتهم في تطبيقهم، وتصلك تحديثات الحالة منهم.', style: TextStyle(color: C.muted, fontSize: 12, height: 1.6)),
                   const SizedBox(height: 10),
@@ -5530,15 +5779,16 @@ class _HomeShellState extends State<HomeShell> {
     _store = context.read<AppStore>();
     _store.startCloud();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _store.settings.mustChange) _forcePasswordChange();
+      if (mounted && cloud.mustChange) _forcePasswordChange();
     });
   }
 
   Future<void> _forcePasswordChange() async {
-    final u = TextEditingController(text: _store.settings.username);
+    final old = TextEditingController();
     final p1 = TextEditingController();
     final p2 = TextEditingController();
     String? err;
+    var busy = false;
     await showDialog(
       context: context,
       barrierDismissible: false,
@@ -5550,11 +5800,11 @@ class _HomeShellState extends State<HomeShell> {
             title: const Text('تأمين الحساب'),
             content: SingleChildScrollView(
               child: Column(mainAxisSize: MainAxisSize.min, children: [
-                const Text('لحماية بياناتك اختر اسم مستخدم وكلمة مرور جديدة قبل المتابعة.', style: TextStyle(fontSize: 12, color: C.muted, height: 1.6)),
+                const Text('هذه كلمة مرور مؤقتة. اختر كلمة مرور جديدة قبل المتابعة (8 أحرف فأكثر، حروف وأرقام).', style: TextStyle(fontSize: 12, color: C.muted, height: 1.6)),
                 const SizedBox(height: 12),
-                TextField(controller: u, decoration: const InputDecoration(labelText: 'اسم المستخدم')),
+                TextField(controller: old, obscureText: true, decoration: const InputDecoration(labelText: 'كلمة المرور المؤقتة')),
                 const SizedBox(height: 10),
-                TextField(controller: p1, obscureText: true, decoration: const InputDecoration(labelText: 'كلمة المرور الجديدة (6 أحرف فأكثر)')),
+                TextField(controller: p1, obscureText: true, decoration: const InputDecoration(labelText: 'كلمة المرور الجديدة')),
                 const SizedBox(height: 10),
                 TextField(controller: p2, obscureText: true, decoration: const InputDecoration(labelText: 'تأكيد كلمة المرور')),
                 if (err != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(err!, style: const TextStyle(color: C.red, fontWeight: FontWeight.w800, fontSize: 12))),
@@ -5562,22 +5812,29 @@ class _HomeShellState extends State<HomeShell> {
             ),
             actions: [
               FilledButton(
-                onPressed: () {
-                  if (u.text.trim().isEmpty) return set(() => err = 'أدخل اسم المستخدم');
-                  if (p1.text.length < 6) return set(() => err = 'كلمة المرور 6 أحرف على الأقل');
-                  if (p1.text == '1234') return set(() => err = 'اختر كلمة مرور غير الافتراضية');
-                  if (p1.text != p2.text) return set(() => err = 'كلمتا المرور غير متطابقتين');
-                  _store.updateCredentials(u.text.trim(), p1.text);
-                  Navigator.pop(ctx);
-                },
-                child: const Text('حفظ ومتابعة'),
+                onPressed: busy
+                    ? null
+                    : () async {
+                        if (p1.text != p2.text) return set(() => err = 'كلمتا المرور غير متطابقتين');
+                        set(() {
+                          busy = true;
+                          err = null;
+                        });
+                        final e = await cloud.changePassword(old.text, p1.text);
+                        if (e != null) return set(() {
+                          busy = false;
+                          err = e;
+                        });
+                        if (ctx.mounted) Navigator.pop(ctx);
+                      },
+                child: Text(busy ? 'جاري الحفظ...' : 'حفظ ومتابعة'),
               ),
             ],
           ),
         ),
       ),
     );
-    if (mounted) toast(context, 'تم تحديث بيانات الدخول ✓');
+    if (mounted) toast(context, 'تم تحديث كلمة المرور ✓');
   }
 
   @override
@@ -5642,7 +5899,10 @@ class _HomeShellState extends State<HomeShell> {
           IconButton(
             tooltip: 'خروج',
             icon: const Icon(Icons.logout_rounded),
-            onPressed: () => context.read<AppStore>().logout(),
+            onPressed: () async {
+              context.read<AppStore>().flush();
+              await cloud.logout();
+            },
           ),
         ],
       ),
@@ -5666,7 +5926,7 @@ class _HomeShellState extends State<HomeShell> {
                       ),
                     ]),
                     const SizedBox(height: 8),
-                    const Text('مكرونة مخلوطة .. طعم يرضيك', style: TextStyle(color: Colors.white70, fontSize: 11)),
+                    if (s.settings.storeAddress.isNotEmpty) Text(s.settings.storeAddress, style: const TextStyle(color: Colors.white70, fontSize: 11)),
                   ]),
                 ),
                 Expanded(
@@ -5799,7 +6059,7 @@ class _SplashGateState extends State<_SplashGate> {
                     const SizedBox(height: 18),
                     Text(s.settings.storeName, style: const TextStyle(color: Colors.white, fontSize: 30, fontWeight: FontWeight.w900)),
                     const SizedBox(height: 6),
-                    const Text('مكرونة مخلوطة .. طعم يرضيك', style: TextStyle(color: C.gold, fontWeight: FontWeight.w700)),
+                    if (s.settings.storeAddress.isNotEmpty) Text(s.settings.storeAddress, style: const TextStyle(color: C.gold, fontWeight: FontWeight.w700)),
                     const SizedBox(height: 28),
                     const SizedBox(width: 26, height: 26, child: CircularProgressIndicator(strokeWidth: 2.5, color: C.gold)),
                   ]),
@@ -5824,7 +6084,11 @@ class SaladBarApp extends StatelessWidget {
       home: _SplashGate(
         child: ListenableBuilder(
           listenable: cloud,
-          builder: (context, _) => cloud.isCaptain ? const CaptainHome() : (s.loggedIn ? const HomeShell() : const LoginScreen()),
+          builder: (context, _) {
+            if (!cloud.signedIn) return const PlatformLogin();
+            if (cloud.isSuper) return const AdminHome();
+            return TenantGate(child: cloud.isCaptain ? const CaptainHome() : const HomeShell());
+          },
         ),
       ),
     );
