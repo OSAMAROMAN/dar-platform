@@ -2,5 +2,5 @@
 //
 // kFbApiKey : مفتاح Web API Key (Project settings ← General)
 // kFbDbUrl  : رابط Realtime Database (يشبه https://xxxx-default-rtdb.firebaseio.com)
-const String kFbApiKey = 'PASTE_API_KEY';
-const String kFbDbUrl = 'PASTE_DB_URL';
+const String kFbApiKey = 'AIzaSyB-mTzunkUNK8_DTcTxBBgkkGtG51SiwMg';
+const String kFbDbUrl = 'https://dar-platform-ab86f-default-rtdb.firebaseio.com/';
