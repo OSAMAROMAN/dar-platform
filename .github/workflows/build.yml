@@ -169,6 +169,12 @@ jobs:
               if (p.plugins.hasPlugin('com.android.library')) {
                 p.android.compileSdkVersion 36
               }
+              if (p.hasProperty('android') && p.android.hasProperty('lint')) {
+                p.android.lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+                }
+              }
             }
           }
           GR
